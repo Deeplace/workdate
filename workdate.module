@@ -1,0 +1,207 @@
+<?php
+
+define("HOLIDAY_API_URI", 'http://www.curs.md/api/holiday/json/0e8b6037f3444cda9feb8b575306938252de6e3f044a52?start_date=%s&end_date=%s');
+define("HOLIDAY_API_DATE_FORMAT", 'd.m.Y');
+
+/**
+ * Implementation of hook_menu().
+ */
+function workdate_menu() {
+  $items = array();
+
+  $items['admin/settings/workdate'] = array(
+    'title' => 'Workdate',
+    'description' => 'Settings for workdate module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('workdate_setttings'),
+    'access arguments' => array('manage work date settings'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Menu callback for 'admin/settings/workdate'.
+ */
+function workdate_setttings(&$form_state) {
+  $form = array(
+   'workdate_service_uri' => array(
+      '#title' => t('Holiday service URI'),
+      '#description' => t('Use %s placeholders for start and end date in increase order.'),
+      '#type'  => 'textfield',
+      '#default_value' => variable_get('workdate_service_uri', HOLIDAY_API_URI),
+    ),
+   'workdate_service_date_format' => array(
+      '#title' => t('Holiday service date format'),
+      '#description' => t('Use !link compatible format.', array('!link' => l('date()', 'http://php.net/manual/en/function.date.php'))),
+      '#type'  => 'textfield',
+      '#default_value' => variable_get('workdate_service_date_format', HOLIDAY_API_DATE_FORMAT),
+    ),
+  );
+
+  return system_settings_form($form);
+}
+
+
+/**
+ * Compute difference between two days using workdays as measure
+ *
+ * @param mixed $date1
+ *   the starting date
+ * @param mixed $date2
+ *   the ending date
+ * @param string $type
+ *   the type of dates provided:
+ *   DATE_OBJECT, DATE_DATETIME, DATE_ISO, DATE_UNIX, DATE_ARRAY
+ */
+function workdate_difference($date1_in, $date2_in, $type = DATE_OBJECT) {
+  // Create cloned objects or original dates will be impacted by
+  // the date_modify() operations done in this code.
+  $date1 = drupal_clone(date_convert($date1_in, $type, DATE_OBJECT));
+  $date2 = drupal_clone(date_convert($date2_in, $type, DATE_OBJECT));
+  if (is_object($date1) && is_object($date2)) {
+    $diff = date_format($date2, 'U') - date_format($date1, 'U');
+    if ($diff == 0 ) {
+      return 0;
+    }
+    elseif ($diff < 0) {
+      // Make sure $date1 is the smaller date.
+      $temp = $date2;
+      $date2 = $date1;
+      $date1 = $temp;
+      $diff = date_format($date2, 'U') - date_format($date1, 'U');
+    }
+    $year_diff = intval(date_format($date2, 'Y') - date_format($date1, 'Y'));
+
+    //Count holidays between these dates
+    workdate_update_period($date1, $date2);
+    $holiday_count = intval(db_result(db_query("SELECT COUNT(`date`) FROM {workdate_holidays} WHERE `date` BETWEEN '%s' AND '%s'",
+          $date1->format('Y-m-d'), $date2->format('Y-m-d')
+          )));
+
+
+    $format = 'z';
+    $item1 = date_format($date1, $format);
+    $item2 = date_format($date2, $format);
+    if ($year_diff == 0) {
+      return intval($item2 - $item1 - $holiday_count + 1);
+    }
+    else {
+      $item_diff = date_days_in_year($date1) - $item1;
+      for ($i = 1; $i < $year_diff; $i++) {
+        date_modify($date1, '+1 year');
+        $item_diff += date_days_in_year($date1);
+      }
+      return $item_diff + $item2 - $holiday_count + 1;
+    }
+
+  }
+  return NULL;
+}
+
+/**
+ * Request to update holiday data in period between dates $d1 and $d2 from external source.
+ *
+ * $d1 is always less than $d2
+ *
+ * @param DateTime $d1
+ *  Requested period start date
+ * @param DateTime $d2
+ *  Requested period end date
+ * @return int
+ *  retrieved record count
+ */
+function workdate_update_period($d1, $d2) {
+  $ret = 0;
+
+  //Get existing period
+  $workdate_sync_period = variable_get('workdate_sync_period', array('start' => NULL, 'end' => NULL));
+
+  //$p1 and $p2 DateTime objects what define existing period
+  $p1 = is_null($workdate_sync_period['start']) ? NULL : new DateTime($workdate_sync_period['start']);
+  $p2 = is_null($workdate_sync_period['end'])   ? NULL : new DateTime($workdate_sync_period['end']);
+
+
+  //Evaluate request period by comparing existing period ($p1, $p2) with desired one ($d1, $d2)
+  if (is_null($p1) || $d1 < $p1) {
+    $r1 = $d1;
+  } else {
+    $r1 = drupal_clone($p2);
+    $r1->add(new DateInterval('P1D'));
+  }
+
+  if (is_null($p2) || $d2 > $p2) {
+    $r2 = $d2;
+  } else {
+    $r2 = drupal_clone($p1);
+    $r2->sub(new DateInterval('P1D'));
+  }
+
+  if ($r1 > $r2) { //$d1, $d2 is inside $p1, $p2
+    return FALSE;
+  }
+
+  $workdate_service_uri = variable_get('workdate_service_uri', HOLIDAY_API_URI);
+  $request_url = sprintf($workdate_service_uri, $r1->format(HOLIDAY_API_DATE_FORMAT), $r2->format(HOLIDAY_API_DATE_FORMAT));
+  $ch = curl_init($request_url);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($ch, CURLOPT_BINARYTRANSFER, true);
+  $json_buf = curl_exec($ch);
+  if ($json_buf) {
+    $holiday_list = json_decode($json_buf);
+    if ($holiday_list) {
+      foreach($holiday_list->holidays as $date) {
+        $date_o = new DateTime($date->date);
+        if (db_query("INSERT INTO {workdate_holidays} (`date`, `type`) VALUES ('%s', 'weekend')", 
+              date('Y-m-d', $date_o->format('U')))) {
+          $ret++;
+          if (is_null($p1) || $date_o < $p1) {
+            $p1 = $date_o;
+          }elseif (is_null($p2) || $date_o > $p2) {
+            $p2 = $date_o;
+          }
+        }
+      }
+
+      variable_set('workdate_sync_period',
+          array('start' => $p1->format('Y-m-d'), 'end' => $p2->format('Y-m-d'))
+          );
+      watchdog('workdate', 'Retrieved @count holiday records in time frame: @start and @end.',
+                array(
+                  '@count' => $ret,
+                  '@start' => $r1->format(HOLIDAY_API_DATE_FORMAT),
+                  '@end'   => $r2->format(HOLIDAY_API_DATE_FORMAT)
+                ),
+                WATCHDOG_INFO,
+                $request_url
+                );
+    } else {
+      watchdog('workdate', 'Failed to decode service response of size @sz.',
+                array(
+                  '@sz'   => format_size(strlen($json_buf))
+                ),
+                WATCHDOG_WARNING,
+                $request_url
+                );
+    }
+
+  } else {
+      watchdog('workdate', 'Failed to retrieve service response.',
+                array(
+                ),
+                WATCHDOG_WARNING,
+                $request_url
+                );
+
+  }
+
+  return $ret;
+}
+
+function workdate_cron() {
+  //Get last sync period
+  $workdate_sync_period = variable_get('workdate_sync_period', array('start' => NULL, 'end' => NULL));
+  $d1 = is_null($workdate_sync_period['end']) ? new DateTime('1 year ago'): new DateTime($workdate_sync_period['end']);
+  workdate_update_period($d1, new DateTime());
+}

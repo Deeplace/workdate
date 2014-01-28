@@ -1,0 +1,6 @@
+name = Work date
+description = Enables workday and holidays aware date functions, like workdate_difference().
+core = 6.x
+php = 5.3
+dependencies[] = date_api
+package = Deeplace
